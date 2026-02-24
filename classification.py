@@ -4,7 +4,7 @@ from collections import defaultdict
 from tqdm import tqdm
 
 # ==============================
-# PARAMETERS (bisa kamu tuning)
+# PARAMETERS
 # ==============================
 INPUT_FILE = "20251212105617000.las"
 OUTPUT_FILE = "classified_output.las"
