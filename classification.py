@@ -1,97 +1,143 @@
 import laspy
 import numpy as np
-from collections import defaultdict
-from tqdm import tqdm
 
 # ==============================
 # PARAMETERS
 # ==============================
-INPUT_FILE = "20251212105617000.las"
-OUTPUT_FILE = "classified_output.las"
+INPUT_FILE = "20251211095257000.las"
+OUTPUT_FILE = "classified_output_besak.las"
 
-GRID_SIZE = 2.0          # meter
-GROUND_THRESHOLD = 0.3   # meter
-HEIGHT_THRESHOLD = 2.0   # meter untuk building/vegetation
+GRID_SIZE = 2.0            # meter
+GROUND_THRESHOLD = 0.3     # meter (<= ini dianggap ground dari local min)
+HEIGHT_THRESHOLD = 2.0     # meter (objek tinggi -> kandidat building/veg)
+
+# Roughness threshold (tuning)
+ROOF_ROUGHNESS_MAX = 0.35  # makin kecil -> makin ketat roof harus rata
+MIN_POINTS_PER_CELL = 10   # minimal point tall per cell supaya roughness tidak noisy
 
 # ==============================
 # LOAD DATA
 # ==============================
 print("Reading LAS file...")
 las = laspy.read(INPUT_FILE)
+n = las.header.point_count
+print("Total points:", n)
 
-print("Total points:", las.header.point_count)
+# IMPORTANT: convert laspy views -> numpy arrays (fix recursion error)
+x = np.asarray(las.x, dtype=np.float64)
+y = np.asarray(las.y, dtype=np.float64)
+z = np.asarray(las.z, dtype=np.float64)
 
-x = las.x
-y = las.y
-z = las.z
+num_ret = np.asarray(las.number_of_returns)
+has_return_number = ("return_number" in las.point_format.dimension_names)
+ret_num = np.asarray(las.return_number) if has_return_number else None
 
 # ==============================
-# STEP 1 — GRID CREATION
+# STEP 1 — GRID BINNING
+# (shift by min to keep bins smaller & stable)
 # ==============================
-print("Creating grid bins...")
-x_bin = np.floor(x / GRID_SIZE)
-y_bin = np.floor(y / GRID_SIZE)
+x0 = x.min()
+y0 = y.min()
 
-# Mapping grid -> min z
+x_bin = np.floor((x - x0) / GRID_SIZE).astype(np.int64)
+y_bin = np.floor((y - y0) / GRID_SIZE).astype(np.int64)
+
+# Build unique cell id via unique rows
+cell_keys = np.stack([x_bin, y_bin], axis=1)
+uniq_cells, inv = np.unique(cell_keys, axis=0, return_inverse=True)
+n_cells = uniq_cells.shape[0]
+
+
+
+print("Grid cells:", n_cells)
+
+# ==============================
+# STEP 2 — MIN Z PER CELL (vectorized)
+# ==============================
 print("Computing minimum elevation per grid...")
-grid_min_z = defaultdict(lambda: np.inf)
+min_z = np.full(n_cells, np.inf, dtype=np.float64)
+np.minimum.at(min_z, inv, z)
 
-for i in tqdm(range(len(z))):
-    key = (x_bin[i], y_bin[i])
-    if z[i] < grid_min_z[key]:
-        grid_min_z[key] = z[i]
+height = z - min_z[inv]
 
 # ==============================
-# STEP 2 — GROUND CLASSIFICATION
+# STEP 3 — GROUND CLASSIFICATION
 # ==============================
 print("Classifying ground...")
-ground_mask = np.zeros(len(z), dtype=bool)
-height = np.zeros(len(z))
-
-for i in tqdm(range(len(z))):
-    key = (x_bin[i], y_bin[i])
-    local_min = grid_min_z[key]
-    height[i] = z[i] - local_min
-    if height[i] <= GROUND_THRESHOLD:
-        ground_mask[i] = True
+ground_mask = height <= GROUND_THRESHOLD
 
 las.classification[:] = 0
-las.classification[ground_mask] = 2  # Ground class
+las.classification[ground_mask] = 2  # Ground
 
 # ==============================
-# STEP 3 — VEGETATION & BUILDING
+# STEP 4 — ROUGHNESS PER CELL (untuk titik tinggi)
+# ==============================
+print("Computing roughness for tall points...")
+non_ground = ~ground_mask
+tall = non_ground & (height > HEIGHT_THRESHOLD)
+
+# bincount but only if there are tall points
+counts = np.bincount(inv[tall], minlength=n_cells).astype(np.float64)
+
+sumz = np.bincount(inv[tall], weights=z[tall], minlength=n_cells)
+sumsq = np.bincount(inv[tall], weights=z[tall] ** 2, minlength=n_cells)
+
+roughness = np.zeros(n_cells, dtype=np.float64)
+valid = counts >= MIN_POINTS_PER_CELL
+mean = np.zeros(n_cells, dtype=np.float64)
+var = np.zeros(n_cells, dtype=np.float64)
+
+mean[valid] = sumz[valid] / counts[valid]
+var[valid] = (sumsq[valid] / counts[valid]) - (mean[valid] ** 2)
+roughness[valid] = np.sqrt(np.maximum(var[valid], 0.0))
+
+roughness_per_point = roughness[inv]
+
+# ==============================
+# STEP 5 — VEGETATION & BUILDING
 # ==============================
 print("Classifying vegetation and building...")
 
-non_ground = ~ground_mask
+has_multi = num_ret > 1
+if ret_num is not None:
+    not_last = ret_num < num_ret
+else:
+    not_last = has_multi  # fallback
 
+# Vegetation: tall + roughness besar + indikasi multiple/not-last return
 vegetation_mask = (
-    non_ground &
-    (height > HEIGHT_THRESHOLD) &
-    (las.number_of_returns > 1)
+    tall &
+    (roughness_per_point > ROOF_ROUGHNESS_MAX) &
+    (has_multi | not_last)
 )
 
+# Building: tall + roughness kecil (rata) + cell cukup padat
 building_mask = (
-    non_ground &
-    (height > HEIGHT_THRESHOLD) &
-    (las.number_of_returns == 1)
+    tall &
+    (roughness_per_point <= ROOF_ROUGHNESS_MAX) &
+    (counts[inv] >= MIN_POINTS_PER_CELL)
 )
 
-las.classification[vegetation_mask] = 5   # Vegetation
-las.classification[building_mask] = 6     # Building
+las.classification[vegetation_mask] = 5  # Vegetation
+las.classification[building_mask] = 6    # Building
 
 # ==============================
-# STEP 4 — SAVE OUTPUT
+# SAVE OUTPUT
 # ==============================
 print("Saving output...")
 las.write(OUTPUT_FILE)
-
-print("Done.")
+print("Done:", OUTPUT_FILE)
 
 # ==============================
 # SUMMARY
 # ==============================
-unique, counts = np.unique(las.classification, return_counts=True)
+cls = np.asarray(las.classification)
+unique, counts_cls = np.unique(cls, return_counts=True)
 print("\nClass distribution:")
-for u, c in zip(unique, counts):
-    print(f"Class {u}: {c} points")
+for u, c in zip(unique, counts_cls):
+    print(f"Class {int(u)}: {int(c)} points")
+
+print("\nNotes:")
+print("- Kalau building banyak ketukar jadi vegetasi: naikkan ROOF_ROUGHNESS_MAX (mis 0.45)")
+print("- Kalau vegetasi banyak ketarik jadi building: turunkan ROOF_ROUGHNESS_MAX (mis 0.25)")
+print("- Kalau hasil noisy: naikkan MIN_POINTS_PER_CELL atau kecilkan GRID_SIZE (mis 1.0)")
